@@ -1,175 +1,143 @@
-import os
 import logging
-import schedule
-import time
-import threading
-from datetime import datetime, timedelta
+import os
+import datetime
+import pandas as pd
 from pymongo import MongoClient
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackContext,
-    MessageHandler,
-    filters,
     CallbackQueryHandler,
+    ContextTypes,
 )
 
-# ================== CONFIG ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # set in Render
-ADMIN_ID = int(os.getenv("ADMIN_ID"))  # your Telegram ID
-MONGO_URI = os.getenv("MONGO_URI")  # your MongoDB Atlas URI
-DB_NAME = "ott_reseller_bot"
-
-# ================== LOGGING ==================
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ================== DB ==================
+# --- Environment Variables ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+MONGO_URI = os.getenv("MONGO_URI")
+
+# --- Database ---
 client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-users_col = db["users"]
-sales_col = db["sales"]
+db = client["ott_bot"]
+users_collection = db["users"]
+sales_collection = db["sales"]
 
-# ================== HANDLERS ==================
-async def start(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    first_name = update.effective_user.first_name
+# --- Start Command ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
 
-    if not users_col.find_one({"user_id": user_id}):
-        users_col.insert_one(
-            {"user_id": user_id, "first_name": first_name, "joined_at": datetime.now()}
+    # Store user in DB if not already
+    if not users_collection.find_one({"user_id": user.id}):
+        users_collection.insert_one(
+            {
+                "user_id": user.id,
+                "username": user.username,
+                "first_name": user.first_name,
+                "joined_at": datetime.datetime.utcnow(),
+            }
         )
         # Notify admin
-        await context.bot.send_message(
-            ADMIN_ID, f"👤 New user started the bot:\nID: {user_id}\nName: {first_name}"
-        )
+        if ADMIN_ID:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"👤 New user started bot:\n\nID: {user.id}\nUsername: @{user.username}",
+            )
 
     keyboard = [
-        [InlineKeyboardButton("📦 My Subscriptions", callback_data="subs")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="stats")],
+        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard")],
+        [InlineKeyboardButton("🛒 My Purchases", callback_data="purchases")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        f"👋 Welcome {first_name}!\nUse the buttons below to navigate.", reply_markup=reply_markup
+        "👋 Welcome to OTT Subscription Bot!\nChoose an option:", reply_markup=reply_markup
     )
 
-
-async def button_handler(update: Update, context: CallbackContext):
+# --- Button Handler ---
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "subs":
-        await query.edit_message_text("📦 You currently have no active subscriptions.")
-    elif query.data == "stats":
-        total_sales = sales_col.count_documents({})
-        await query.edit_message_text(f"📊 Total sales recorded: {total_sales}")
+    if query.data == "dashboard":
+        await query.edit_message_text("📊 Your Dashboard (coming soon...)")
+    elif query.data == "purchases":
+        await query.edit_message_text("🛒 Your Purchases (coming soon...)")
 
-
-async def add_sale(update: Update, context: CallbackContext):
-    """Admin manually adds a sale: /addsale amount profit days username"""
+# --- Admin: Add Sale ---
+async def add_sale(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
     try:
         amount = float(context.args[0])
         profit = float(context.args[1])
-        days = int(context.args[2])
-        username = context.args[3]
+        customer_id = int(context.args[2])
 
-        expiry = datetime.now() + timedelta(days=days)
-        sales_col.insert_one(
+        sales_collection.insert_one(
             {
+                "customer_id": customer_id,
                 "amount": amount,
                 "profit": profit,
-                "expiry": expiry,
-                "username": username,
-                "date": datetime.now(),
+                "date": datetime.datetime.utcnow(),
             }
         )
-        await update.message.reply_text(
-            f"✅ Sale added!\n💰 Amount: {amount}\n📈 Profit: {profit}\n📅 Expires: {expiry.date()}"
-        )
+
+        await update.message.reply_text("✅ Sale recorded successfully!")
+
     except Exception as e:
-        await update.message.reply_text("❌ Usage: /addsale amount profit days username")
+        await update.message.reply_text(
+            "❌ Usage: /addsale <amount> <profit> <customer_id>"
+        )
         logger.error(e)
 
-
-async def report(update: Update, context: CallbackContext):
-    """Manual report command"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    await send_report(context)
-
-
-async def send_report(context: CallbackContext):
-    """Generate and send report to admin"""
-    sales = list(sales_col.find({}))
-    total_sales = sum(s["amount"] for s in sales)
-    total_profit = sum(s["profit"] for s in sales)
-    count = len(sales)
-
-    msg = (
-        "📊 Daily Report\n\n"
-        f"🛒 Total Sales: {count}\n"
-        f"💰 Revenue: {total_sales}\n"
-        f"📈 Profit: {total_profit}\n"
-        f"📅 Date: {datetime.now().strftime('%Y-%m-%d')}"
+# --- Daily Report to Admin ---
+async def send_daily_report(application: Application):
+    today = datetime.datetime.utcnow().date()
+    sales = list(
+        sales_collection.find(
+            {"date": {"$gte": datetime.datetime(today.year, today.month, today.day)}}
+        )
     )
 
-    await context.bot.send_message(chat_id=ADMIN_ID, text=msg)
+    if not sales:
+        text = "📊 Daily Report:\nNo sales recorded today."
+    else:
+        total_amount = sum(s["amount"] for s in sales)
+        total_profit = sum(s["profit"] for s in sales)
+        text = (
+            f"📊 Daily Report\n\n"
+            f"Total Sales: {len(sales)}\n"
+            f"Total Amount: ₹{total_amount}\n"
+            f"Total Profit: ₹{total_profit}"
+        )
 
+    if ADMIN_ID:
+        await application.bot.send_message(chat_id=ADMIN_ID, text=text)
 
-async def broadcast(update: Update, context: CallbackContext):
-    """Broadcast a message to all users"""
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if not context.args:
-        await update.message.reply_text("❌ Usage: /broadcast your_message")
-        return
+# --- Scheduler ---
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    await send_daily_report(context.application)
 
-    text = " ".join(context.args)
-    users = users_col.find({})
-    count = 0
-    for user in users:
-        try:
-            await context.bot.send_message(user["user_id"], text)
-            count += 1
-        except Exception:
-            continue
-    await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
-
-
-# ================== SCHEDULER ==================
-def schedule_reports(app: Application):
-    def run():
-        while True:
-            schedule.run_pending()
-            time.sleep(60)
-
-    async def job():
-        await send_report(app.bot)
-
-    schedule.every().day.at("00:00").do(lambda: app.create_task(job()))
-    threading.Thread(target=run, daemon=True).start()
-
-
-# ================== MAIN ==================
+# --- Main Function ---
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    # Commands
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("addsale", add_sale))
-    app.add_handler(CommandHandler("report", report))
-    app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    schedule_reports(app)
+    # Daily Report Job
+    app.job_queue.run_daily(daily_job, time=datetime.time(hour=21, minute=0))  # 9 PM UTC
 
+    # Start Bot
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
